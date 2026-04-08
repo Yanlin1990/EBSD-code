@@ -407,17 +407,17 @@ def _find_neighbor_pairs_vectorised(gm: np.ndarray) -> Set[Tuple[int, int]]:
 def _avg_quaternion_eigenvalue(quats: np.ndarray) -> "Quat":
     """Compute average quaternion via eigenvalue method (Fréchet mean on SO(3)).
 
-    For large arrays, a random subsample of ``MAX_GRAIN_SAMPLE`` pixels is used
-    to keep computation fast.  All input quaternions must be Quat instances in a
-    1-D numpy object array.
+    For large arrays, a deterministic subsample of ``MAX_GRAIN_SAMPLE`` pixels
+    is used to keep computation fast.  All input quaternions must be Quat
+    instances in a 1-D numpy object array.
     """
     if len(quats) > MAX_GRAIN_SAMPLE:
-        idx = np.random.choice(len(quats), MAX_GRAIN_SAMPLE, replace=False)
+        rng = np.random.default_rng(seed=0)
+        idx = rng.choice(len(quats), MAX_GRAIN_SAMPLE, replace=False)
         quats = quats[idx]
-    # Stack into (N, 4) float array
+    # Stack into (N, 4) float array; use quat_coef (DefDAP snake_case attribute)
     q_arr = np.array(
-        [[q.quatCoef[0], q.quatCoef[1], q.quatCoef[2], q.quatCoef[3]]
-         for q in quats],
+        [q.quat_coef for q in quats],
         dtype=np.float64,
     )
     # Ensure consistent hemisphere (dot product with first quat > 0)
@@ -2184,9 +2184,15 @@ class EbsdMainWindow(QMainWindow):
     # ----------------------------------------------------------------
 
     def _start_render(self, params: dict) -> None:
-        """Launch the worker thread with the given render params."""
+        """Launch the worker thread with the given render params.
+
+        If a render is already in progress, the new params are stored as
+        pending and the render will be triggered once the current one finishes.
+        Only the most recent pending request is kept (intermediate states are
+        intentionally skipped for performance).
+        """
         if self._render_busy:
-            self._pending_params = params
+            self._pending_params = params  # overwrite any earlier pending request
             return
         self._render_busy = True
         self._pending_params = None
@@ -2395,6 +2401,7 @@ class EbsdMainWindow(QMainWindow):
 
     def on_canvas_click(self, event: Any) -> None:
         if self._render_busy:
+            self.statusBar().showMessage("Rendering in progress, please wait…")
             return
         if self.current_map is None or event.inaxes is None:
             return
