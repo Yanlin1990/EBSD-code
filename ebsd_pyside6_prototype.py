@@ -27,6 +27,7 @@ Key improvements over the initial version
 from __future__ import annotations
 
 import logging
+import time
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple, Set
@@ -76,6 +77,8 @@ from defdap.quat import Quat
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["EbsdMainWindow"]
+
 # ====================================================================
 # Named constants (replace former magic numbers)
 # ====================================================================
@@ -115,6 +118,9 @@ MIN_TWIN_CONTOUR_POINTS: int = 3
 
 MIN_LAGB_SEGMENT_POINTS: int = 3
 """LAGB segments shorter than this are discarded."""
+
+MAX_GRAIN_SAMPLE: int = 500
+"""Maximum pixels sampled per grain when computing average orientation."""
 
 
 # ====================================================================
@@ -351,21 +357,12 @@ def _vectorised_median_fill_2d(
     img: np.ndarray,
     mask: np.ndarray,
 ) -> np.ndarray:
-    """Fill masked pixels with the median of their valid 3×3 neighbours."""
-    img = img.copy().astype(np.float64)
+    """Fill masked pixels using a full-image 3x3 median filter (vectorised)."""
+    img = img.copy().astype(np.float32)
     if not np.any(mask):
         return img
-    h, w = img.shape
-    padded = np.pad(img, 1, mode="edge")
-    valid_pad = np.pad(~mask, 1, constant_values=False)
-    ys, xs = np.where(mask)
-    for y, x in zip(ys, xs):
-        py, px = y + 1, x + 1
-        nb_vals = padded[py - 1: py + 2, px - 1: px + 2]
-        nb_valid = valid_pad[py - 1: py + 2, px - 1: px + 2]
-        good = nb_vals[nb_valid]
-        if good.size > 0:
-            img[y, x] = np.median(good)
+    filtered = median_filter(img, size=3)
+    img[mask] = filtered[mask]
     return img
 
 
@@ -373,23 +370,13 @@ def _vectorised_median_fill_rgb(
     img: np.ndarray,
     mask: np.ndarray,
 ) -> np.ndarray:
-    """Fill masked pixels with the median of their valid 3×3 neighbours (RGB)."""
-    img = img.copy().astype(np.float64)
+    """Fill masked pixels with channel-wise 3x3 median (vectorised, RGB)."""
+    img = img.copy().astype(np.float32)
     if not np.any(mask):
         return img
-    h, w, n_ch = img.shape
-    ys, xs = np.where(mask)
-    for ch in range(n_ch):
-        channel = img[:, :, ch]
-        padded = np.pad(channel, 1, mode="edge")
-        valid_pad = np.pad(~mask, 1, constant_values=False)
-        for y, x in zip(ys, xs):
-            py, px = y + 1, x + 1
-            nb_vals = padded[py - 1: py + 2, px - 1: px + 2]
-            nb_valid = valid_pad[py - 1: py + 2, px - 1: px + 2]
-            good = nb_vals[nb_valid]
-            if good.size > 0:
-                img[y, x, ch] = np.median(good)
+    for ch in range(img.shape[2]):
+        filtered = median_filter(img[:, :, ch], size=3)
+        img[mask, ch] = filtered[mask]
     return img
 
 
@@ -419,8 +406,432 @@ def _find_neighbor_pairs_vectorised(gm: np.ndarray) -> Set[Tuple[int, int]]:
 
 
 # ====================================================================
-# Background worker for heavy computation
+# Quaternion average (eigenvalue method)
 # ====================================================================
+
+
+def _avg_quaternion_eigenvalue(quats_array: Any) -> np.ndarray:
+    """Compute mean quaternion via the eigenvalue method.
+
+    Builds M = sum(qi * qi^T) and returns the eigenvector for the
+    largest eigenvalue -- the globally optimal L2 mean quaternion.
+    """
+    M = np.zeros((4, 4), dtype=np.float64)
+    n = 0
+    for q in quats_array:
+        coef = np.asarray(q.quat_coef, dtype=np.float64).ravel()[:4]
+        M += np.outer(coef, coef)
+        n += 1
+    if n == 0:
+        return np.array([1.0, 0.0, 0.0, 0.0])
+    _, eigvecs = np.linalg.eigh(M)
+    return eigvecs[:, -1]
+
+
+# ====================================================================
+# Pure computation helpers (thread-safe -- no Qt widget access)
+# ====================================================================
+
+
+def _get_non_indexed_mask_pure(m: Any) -> np.ndarray:
+    """Detect non-indexed pixels. Returns bool (H, W), True = bad."""
+    h = w = None
+    mask = None
+    try:
+        phase = np.asarray(m.data.phase)
+        h, w = phase.shape
+        mask = phase == 0
+    except Exception:
+        logger.debug("No phase data for non-indexed detection")
+    try:
+        bc = np.asarray(m.data.band_contrast)
+        if h is None:
+            h, w = bc.shape
+        bc_bad = bc <= 0
+        mask = bc_bad if mask is None else (mask | bc_bad)
+    except Exception:
+        logger.debug("No band-contrast data for non-indexed detection")
+    try:
+        ea = np.asarray(m.data.euler_angle)
+        ea_sum = np.abs(ea[0]) + np.abs(ea[1]) + np.abs(ea[2])
+        ea_bad = ea_sum < EULER_ZERO_THRESHOLD
+        if h is None:
+            h, w = ea_bad.shape
+        mask = ea_bad if mask is None else (mask | ea_bad)
+    except Exception:
+        logger.debug("No Euler-angle data for non-indexed detection")
+    if mask is None:
+        if h is None:
+            return np.zeros((1, 1), dtype=bool)
+        return np.zeros((h, w), dtype=bool)
+    return mask
+
+
+def _get_bc_array_pure(
+    m: Any,
+    brightness: float,
+    contrast: float,
+) -> np.ndarray:
+    """Compute normalised band-contrast array with brightness/contrast."""
+    bc = np.asarray(m.data.band_contrast).astype(np.float32)
+    lo, hi = float(bc.min()), float(bc.max())
+    if hi > lo:
+        bc = (bc - lo) / (hi - lo)
+    else:
+        bc = np.zeros_like(bc)
+    if abs(brightness - 1.0) > BRIGHTNESS_CHANGE_EPSILON:
+        bc = bc * brightness
+    if abs(contrast - 1.0) > CONTRAST_CHANGE_EPSILON:
+        bc = (bc - 0.5) * contrast + 0.5
+    return np.clip(bc, 0.0, 1.0)
+
+
+def _normalize_rgb_pure(a: np.ndarray) -> np.ndarray:
+    """Normalize an RGB image to float32 in [0, 1]."""
+    if a.dtype == np.uint8:
+        a = a.astype(np.float32) / 255.0
+    elif a.dtype != np.float32:
+        a = a.astype(np.float32)
+    mx = float(a.max())
+    if mx > 1.5 and mx > 0:
+        a = a / mx
+    if a.ndim == 3 and a.shape[2] == 4:
+        a = a[:, :, :3]
+    return np.clip(a, 0.0, 1.0)
+
+
+def _compute_ipf_rgb_pure(m: Any, direction: np.ndarray) -> np.ndarray:
+    """Compute IPF colour map for given reference direction."""
+    q = np.array(m.data["orientation"])
+    fq = q.ravel()
+    rgb = Quat.calc_ipf_colours(fq, direction, m.crystal_sym)
+    return rgb.T.reshape(q.shape + (3,)).astype(np.float32)
+
+
+def _fill_non_indexed_pure(
+    img: np.ndarray,
+    mask: np.ndarray,
+    method: str,
+    max_iter: int,
+) -> np.ndarray:
+    """Fill non-indexed pixels in a 2-D or (H, W, C) array."""
+    if method == "leave as-is" or not np.any(mask):
+        return img
+    img = img.copy()
+    is_rgb = img.ndim == 3
+    if method == "black":
+        img[mask] = 0.0
+        return img
+    if method == "white":
+        if is_rgb:
+            img[mask] = 1.0
+        else:
+            mx = float(img[~mask].max()) if np.any(~mask) else 1.0
+            img[mask] = mx
+        return img
+    if method == "fill (median 3\u00d73)":
+        if is_rgb:
+            return _vectorised_median_fill_rgb(img, mask).astype(img.dtype)
+        return _vectorised_median_fill_2d(img, mask).astype(img.dtype)
+    # "fill (neighbor)"
+    if is_rgb:
+        return _vectorised_neighbor_fill_rgb(img, mask, max_iter).astype(img.dtype)
+    return _vectorised_neighbor_fill_2d(img, mask, max_iter).astype(img.dtype)
+
+
+def _denoise_2d_pure(
+    a: np.ndarray,
+    method: str,
+    median_kernel: int,
+    gauss_sigma: float,
+) -> np.ndarray:
+    """Apply denoising to a 2-D array."""
+    if method == "Median":
+        k = median_kernel
+        if k < 2:
+            return a
+        k = k if k % 2 == 1 else k + 1
+        return median_filter(a.copy(), size=k)
+    if method == "Gaussian":
+        if gauss_sigma < 0.01:
+            return a
+        return gaussian_filter(
+            a.copy().astype(np.float64), sigma=gauss_sigma,
+        ).astype(a.dtype)
+    return a
+
+
+def _denoise_rgb_pure(
+    a: np.ndarray,
+    method: str,
+    median_kernel: int,
+    gauss_sigma: float,
+) -> np.ndarray:
+    """Apply denoising to an (H, W, C) RGB array."""
+    if method == "Median":
+        k = median_kernel
+        if k < 2:
+            return a
+        k = k if k % 2 == 1 else k + 1
+        a = a.copy()
+        return np.dstack([
+            median_filter(a[:, :, i], size=k)
+            for i in range(a.shape[2])
+        ])
+    if method == "Gaussian":
+        if gauss_sigma < 0.01:
+            return a
+        a = a.copy().astype(np.float64)
+        for i in range(a.shape[2]):
+            a[:, :, i] = gaussian_filter(a[:, :, i], sigma=gauss_sigma)
+        return a.astype(np.float32)
+    return a
+
+
+def _blend_bc_ipf_pure(
+    bc: np.ndarray,
+    ipf_rgb: np.ndarray,
+    alpha: float,
+    mode: str,
+) -> np.ndarray:
+    """Blend band-contrast and IPF images."""
+    bc3 = np.dstack([bc, bc, bc])
+    if mode == "multiply":
+        mult = bc3 * ipf_rgb
+        result = bc3 * (1.0 - alpha) + mult * alpha
+        result *= MULTIPLY_BLEND_BOOST
+    elif mode == "soft_light":
+        m_ = ipf_rgb <= 0.5
+        soft = np.where(
+            m_,
+            bc3 - (1 - 2 * ipf_rgb) * bc3 * (1 - bc3),
+            bc3 + (2 * ipf_rgb - 1) * (
+                np.sqrt(np.maximum(bc3, 0)) - bc3),
+        )
+        result = bc3 * (1.0 - alpha) + soft * alpha
+    else:  # overlay
+        result = bc3 * (1.0 - alpha) + ipf_rgb * alpha
+    return np.clip(result, 0.0, 1.0).astype(np.float32)
+
+
+def _build_clean_grain_map_pure(
+    m: Any,
+    gb_angle: float,
+    min_grain: int,
+    hole_fill: int,
+    frag_merge: int,
+) -> np.ndarray:
+    """Build hole-filled, fragment-merged grain ID map."""
+    gm = np.asarray(m.data["grains"]).copy()
+    if hole_fill > 0:
+        inv = gm <= 0
+        if np.any(inv):
+            lh, nh = ndlabel(inv)
+            for hid in range(1, nh + 1):
+                hm = lh == hid
+                if hm.sum() > hole_fill:
+                    continue
+                d = _binary_dilation(hm, iterations=1)
+                b = d & ~hm
+                ni = gm[b]
+                ni = ni[ni > 0]
+                if ni.size > 0:
+                    gm[hm] = int(np.bincount(ni).argmax())
+    if frag_merge > 0:
+        for gid in np.unique(gm):
+            if gid <= 0:
+                continue
+            grain_mask = gm == gid
+            if grain_mask.sum() >= frag_merge:
+                continue
+            d = _binary_dilation(grain_mask, iterations=1)
+            b = d & ~grain_mask
+            ni = gm[b]
+            ni = ni[(ni > 0) & (ni != gid)]
+            if ni.size > 0:
+                gm[grain_mask] = int(np.bincount(ni).argmax())
+            else:
+                gm[grain_mask] = 0
+    return gm
+
+
+def _smooth_contour_pure(
+    x: np.ndarray,
+    y: np.ndarray,
+    sigma: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Smooth a contour with adaptive Gaussian."""
+    n = len(x)
+    if sigma < 0.05 or n < 5:
+        return x, y
+    asig = max(
+        sigma * min(1.0, n / SMOOTH_CONTOUR_LENGTH_SCALE),
+        sigma * SMOOTH_CONTOUR_MIN_SIGMA_FRAC,
+    )
+    closed = abs(x[0] - x[-1]) < 1.0 and abs(y[0] - y[-1]) < 1.0
+    mode = "wrap" if closed else "nearest"
+    return (
+        gaussian_filter1d(x, sigma=asig, mode=mode),
+        gaussian_filter1d(y, sigma=asig, mode=mode),
+    )
+
+
+def _contours_from_grain_map_pure(
+    grain_map: np.ndarray,
+    sigma: float,
+) -> List[np.ndarray]:
+    """Extract and smooth grain boundary contours."""
+    uids = np.unique(grain_map)
+    uids = uids[uids > 0]
+    all_c: List[np.ndarray] = []
+    for gid in uids:
+        mask_f = (grain_map == gid).astype(np.float32)
+        for c in find_contours(mask_f, level=0.5):
+            if c.shape[0] < MIN_CONTOUR_POINTS:
+                continue
+            y, x = c[:, 0], c[:, 1]
+            x, y = _smooth_contour_pure(x, y, sigma)
+            all_c.append(np.column_stack([x, y]))
+    return all_c
+
+
+def _contiguous_segments_pure(
+    mask_1d: np.ndarray,
+    min_length: int,
+) -> List[Tuple[int, int]]:
+    """Return (start, end) pairs of contiguous True runs in *mask_1d*."""
+    segs: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for i, val in enumerate(mask_1d):
+        if val:
+            if start is None:
+                start = i
+        else:
+            if start is not None:
+                if i - start >= min_length:
+                    segs.append((start, i))
+                start = None
+    if start is not None and len(mask_1d) - start >= min_length:
+        segs.append((start, len(mask_1d)))
+    return segs
+
+
+def _detect_twin_boundaries_pure(
+    params: dict,
+    m: Any,
+    clean_gm: np.ndarray,
+    neighbor_pairs: Any,
+) -> dict:
+    """Detect twin boundaries using eigenvalue-averaged grain orientations."""
+    sym = params["crystal_sym"]
+    twin_defs = params["twin_defs"]
+    if not twin_defs:
+        return {}
+
+    quats = np.array(m.data["orientation"])
+    strict = params["strict_axis"]
+    check_fn = check_twin_with_axis if strict else check_twin_relation
+
+    grain_ids = np.unique(clean_gm)
+    grain_ids = grain_ids[grain_ids > 0]
+    grain_avg_ori: Dict[int, Any] = {}
+
+    for gid in grain_ids:
+        ys, xs = np.where(clean_gm == gid)
+        n_px = len(ys)
+        if n_px > MAX_GRAIN_SAMPLE:
+            idx = np.linspace(0, n_px - 1, MAX_GRAIN_SAMPLE).astype(int)
+            ys_s, xs_s = ys[idx], xs[idx]
+        else:
+            ys_s, xs_s = ys, xs
+        grain_quats_obj = quats[ys_s, xs_s]
+        avg_coef = _avg_quaternion_eigenvalue(grain_quats_obj)
+        grain_avg_ori[gid] = Quat(avg_coef)
+
+    twin_pairs: Dict[str, set] = {td["name"]: set() for td in twin_defs}
+    for g_a, g_b in neighbor_pairs:
+        if g_a not in grain_avg_ori or g_b not in grain_avg_ori:
+            continue
+        for td in twin_defs:
+            if check_fn(grain_avg_ori[g_a], grain_avg_ori[g_b], sym, td):
+                twin_pairs[td["name"]].add((g_a, g_b))
+                break
+
+    result: dict = {}
+    sigma = params["gb_smooth"]
+    for td in twin_defs:
+        pairs = twin_pairs[td["name"]]
+        if not pairs:
+            continue
+        contours: List[np.ndarray] = []
+        for g_a, g_b in pairs:
+            boundary = (
+                _binary_dilation(clean_gm == g_a, iterations=1)
+                & (clean_gm == g_b)
+            )
+            if boundary.sum() < 2:
+                continue
+            for c in find_contours(boundary.astype(np.float32), level=0.5):
+                if c.shape[0] < MIN_TWIN_CONTOUR_POINTS:
+                    continue
+                y_c, x_c = c[:, 0], c[:, 1]
+                if len(x_c) > 4:
+                    x_c, y_c = _smooth_contour_pure(x_c, y_c, sigma)
+                contours.append(np.column_stack([x_c, y_c]))
+        if contours:
+            result[td["name"]] = {
+                "contours": contours,
+                "color": td["color"],
+            }
+    return result
+
+
+def _extract_lagb_contours_pure(
+    params: dict,
+    m: Any,
+    lagb_sub_gm: np.ndarray,
+    ha_gm: np.ndarray,
+) -> List[np.ndarray]:
+    """Extract LAGB contours clipped to HAGB grain interiors."""
+    sigma = params["lagb_smooth"]
+    h_map, w_map = ha_gm.shape
+    all_c: List[np.ndarray] = []
+    for ha_id in np.unique(ha_gm):
+        if ha_id <= 0:
+            continue
+        ha_mask = ha_gm == ha_id
+        sub_ids = np.unique(lagb_sub_gm[ha_mask])
+        sub_ids = sub_ids[sub_ids > 0]
+        if len(sub_ids) <= 1:
+            continue
+        for sid in sub_ids:
+            sm = (lagb_sub_gm == sid) & ha_mask
+            if sm.sum() < 3:
+                continue
+            for c in find_contours(sm.astype(np.float32), level=0.5):
+                if c.shape[0] < MIN_CONTOUR_POINTS:
+                    continue
+                y, x = c[:, 0], c[:, 1]
+                ix = np.clip(np.round(x).astype(int), 0, w_map - 1)
+                iy = np.clip(np.round(y).astype(int), 0, h_map - 1)
+                inside = ha_gm[iy, ix] == ha_id
+                segs = _contiguous_segments_pure(inside, MIN_LAGB_SEGMENT_POINTS)
+                for s, e in segs:
+                    sx, sy = x[s:e], y[s:e]
+                    if len(sx) > 4:
+                        sx, sy = _smooth_contour_pure(sx, sy, sigma)
+                    all_c.append(np.column_stack([sx, sy]))
+    return all_c
+
+
+def _extract_image_array_static(ax: Any) -> Optional[np.ndarray]:
+    """Extract the first image array from a Matplotlib axes."""
+    if not ax.images:
+        return None
+    return np.asarray(ax.images[0].get_array()).copy()
+
+
+
 
 
 class _RenderWorker(QObject):
@@ -496,6 +907,22 @@ class EbsdMainWindow(QMainWindow):
         self.current_fig_ready: bool = False
         self._twin_boundary_cache: Optional[dict] = None
         self._cached_raw_map: Optional[ebsd.Map] = None
+        self._cached_lagb_map: Optional[ebsd.Map] = None
+
+        # Async rendering state
+        self._render_busy: bool = False
+        self._pending_params: Optional[dict] = None
+        self._worker_thread: Optional[QThread] = None
+        self._current_worker: Optional[_RenderWorker] = None
+
+        # Multi-level caches -- stored as (key, value) tuples
+        self._cache_mask: Tuple[Any, Any] = (None, None)
+        self._cache_bc: Tuple[Any, Any] = (None, None)
+        self._cache_ipf: Tuple[Any, Any] = (None, None)
+        self._cache_clean_gm: Tuple[Any, Any] = (None, None)
+        self._cache_neighbor_pairs: Tuple[Any, Any] = (None, None)
+        self._cache_twin: Tuple[Any, Any] = (None, None)
+        self._cache_lagb_grains: Tuple[Any, Any] = (None, None)
 
         # Widget registration list (auto enable/disable)
         self._data_widgets: List[QWidget] = []
@@ -510,9 +937,6 @@ class EbsdMainWindow(QMainWindow):
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(DEBOUNCE_MS)
         self._refresh_timer.timeout.connect(self._do_refresh)
-
-        # Worker thread (lazy)
-        self._worker_thread: Optional[QThread] = None
 
     # ----------------------------------------------------------------
     # Widget factory helpers
@@ -1056,20 +1480,24 @@ class EbsdMainWindow(QMainWindow):
             self._cached_raw_map = ebsd.Map(self.current_path)
         return self._cached_raw_map
 
-    def _ensure_grains(self, m: ebsd.Map) -> None:
-        if "grain_boundaries" not in m.data:
-            m.data.generate(
-                "grain_boundaries",
-                misori_tol=self.spin_gb_angle.value(),
-            )
-        if "grains" not in m.data:
-            m.data.generate(
-                "grains",
-                min_grain_size=self.spin_min_grain.value(),
-            )
+    # ================================================================
+    # Cache management
+    # ================================================================
+
+    def _invalidate_all_caches(self) -> None:
+        """Reset all caches. Call when a new file is loaded."""
+        self._cached_raw_map = None
+        self._cached_lagb_map = None
+        self._cache_mask = (None, None)
+        self._cache_bc = (None, None)
+        self._cache_ipf = (None, None)
+        self._cache_clean_gm = (None, None)
+        self._cache_neighbor_pairs = (None, None)
+        self._cache_twin = (None, None)
+        self._cache_lagb_grains = (None, None)
 
     # ================================================================
-    # Non-indexed pixel detection
+    # Twin helpers (UI read -- main thread only)
     # ================================================================
 
     def _get_non_indexed_mask(self, m: ebsd.Map) -> np.ndarray:
@@ -1342,123 +1770,11 @@ class EbsdMainWindow(QMainWindow):
         return all_c
 
     # ================================================================
-    # Boundary overlays
+    # Boundary overlays  (logic moved to _compute_render_result)
     # ================================================================
 
-    def _overlay_hagb(self, ax: Any, m: ebsd.Map) -> None:
-        if not self.chk_plot_gbs.isChecked():
-            return
-        cm = self._build_clean_grain_map(m)
-        cs = self._contours_from_grain_map(cm, self.spin_gb_smooth.value())
-        if not cs:
-            return
-        ax.add_collection(LineCollection(
-            cs,
-            colors=self.combo_gb_color.currentText(),
-            linewidths=self.spin_gb_width.value(),
-            alpha=self.spin_gb_alpha.value(),
-            antialiaseds=True,
-            capstyle="round",
-            joinstyle="round",
-            zorder=10,
-        ))
-
-    def _extract_lagb_contours(self, m: ebsd.Map) -> List[np.ndarray]:
-        """Extract LAGB contours *without* re-loading the map from disk."""
-        if not self.chk_plot_lagb.isChecked():
-            return []
-        lagb_min = self.spin_lagb_min.value()
-
-        # Reuse the cached map (with fresh grain computation)
-        mt = self._load_map()
-        mt.data.generate("grain_boundaries", misori_tol=lagb_min)
-        mt.data.generate(
-            "grains",
-            min_grain_size=max(self.spin_min_grain.value() // 2, 2),
-        )
-        sub_gm = np.asarray(mt.data["grains"]).copy()
-        ha_gm = self._build_clean_grain_map(m)
-        sigma = self.spin_lagb_smooth.value()
-        h_map, w_map = ha_gm.shape
-        all_c: List[np.ndarray] = []
-
-        for ha_id in np.unique(ha_gm):
-            if ha_id <= 0:
-                continue
-            ha_mask = ha_gm == ha_id
-            sub_ids = np.unique(sub_gm[ha_mask])
-            sub_ids = sub_ids[sub_ids > 0]
-            if len(sub_ids) <= 1:
-                continue
-            for sid in sub_ids:
-                sm = (sub_gm == sid) & ha_mask
-                if sm.sum() < 3:
-                    continue
-                for c in find_contours(sm.astype(np.float64), level=0.5):
-                    if c.shape[0] < MIN_CONTOUR_POINTS:
-                        continue
-                    y, x = c[:, 0], c[:, 1]
-                    # Vectorised "inside" check
-                    ix = np.clip(np.round(x).astype(int), 0, w_map - 1)
-                    iy = np.clip(np.round(y).astype(int), 0, h_map - 1)
-                    inside = ha_gm[iy, ix] == ha_id
-                    # Split into contiguous segments
-                    segs = self._contiguous_segments(inside, MIN_LAGB_SEGMENT_POINTS)
-                    for s, e in segs:
-                        sx, sy = x[s:e], y[s:e]
-                        if len(sx) > 4:
-                            sx, sy = self._smooth_contour(sx, sy, sigma)
-                        all_c.append(np.column_stack([sx, sy]))
-        return all_c
-
-    @staticmethod
-    def _contiguous_segments(
-        mask_1d: np.ndarray,
-        min_length: int,
-    ) -> List[Tuple[int, int]]:
-        """Return (start, end) pairs of contiguous True runs in *mask_1d*."""
-        segs: List[Tuple[int, int]] = []
-        start: Optional[int] = None
-        for i, val in enumerate(mask_1d):
-            if val:
-                if start is None:
-                    start = i
-            else:
-                if start is not None:
-                    if i - start >= min_length:
-                        segs.append((start, i))
-                    start = None
-        if start is not None and len(mask_1d) - start >= min_length:
-            segs.append((start, len(mask_1d)))
-        return segs
-
-    def _overlay_lagb(self, ax: Any, m: ebsd.Map) -> None:
-        if not self.chk_plot_lagb.isChecked():
-            return
-        cs = self._extract_lagb_contours(m)
-        if not cs:
-            return
-        stm = {
-            "solid": "solid",
-            "dashed": (0, (5, 3)),
-            "dotted": (0, (1, 2)),
-            "dashdot": "dashdot",
-        }
-        ax.add_collection(LineCollection(
-            cs,
-            colors=self.combo_lagb_color.currentText(),
-            linewidths=self.spin_lagb_width.value(),
-            alpha=self.spin_lagb_alpha.value(),
-            linestyles=stm.get(
-                self.combo_lagb_style.currentText(), "dashed"),
-            antialiaseds=True,
-            capstyle="round",
-            joinstyle="round",
-            zorder=11,
-        ))
-
     # ================================================================
-    # Twin detection (vectorised neighbour-pair finding)
+    # Twin helpers (UI read -- main thread only)
     # ================================================================
 
     def _get_active_twin_defs(self, sym_group: str) -> List[dict]:
@@ -1474,348 +1790,647 @@ class EbsdMainWindow(QMainWindow):
             defs.append(td)
         return defs
 
-    def _detect_twin_boundaries(self, m: ebsd.Map) -> dict:
-        sym = m.crystal_sym
-        twin_defs = self._get_active_twin_defs(sym)
-        if not twin_defs:
-            return {}
-        self._ensure_grains(m)
-        gm = self._build_clean_grain_map(m)
-        quats = np.array(m.data["orientation"])
-        h, w = gm.shape
-        strict = self.chk_strict_axis.isChecked()
-        check_fn = check_twin_with_axis if strict else check_twin_relation
-
-        grain_ids = np.unique(gm)
-        grain_ids = grain_ids[grain_ids > 0]
-        grain_avg_ori: Dict[int, Quat] = {}
-        for gid in grain_ids:
-            ys, xs = np.where(gm == gid)
-            cy = int(np.clip(np.mean(ys), 0, h - 1))
-            cx = int(np.clip(np.mean(xs), 0, w - 1))
-            grain_avg_ori[gid] = quats[cy, cx]
-
-        # Vectorised neighbour-pair detection
-        neighbor_pairs = _find_neighbor_pairs_vectorised(gm)
-
-        twin_pairs: Dict[str, set] = {td["name"]: set() for td in twin_defs}
-        for g_a, g_b in neighbor_pairs:
-            if g_a not in grain_avg_ori or g_b not in grain_avg_ori:
-                continue
-            for td in twin_defs:
-                if check_fn(
-                    grain_avg_ori[g_a],
-                    grain_avg_ori[g_b],
-                    sym,
-                    td,
-                ):
-                    twin_pairs[td["name"]].add((g_a, g_b))
-                    break
-
-        result: dict = {}
-        sigma = self.spin_gb_smooth.value()
-        for td in twin_defs:
-            pairs = twin_pairs[td["name"]]
-            if not pairs:
-                continue
-            contours: List[np.ndarray] = []
-            for g_a, g_b in pairs:
-                boundary = (
-                    _binary_dilation(gm == g_a, iterations=1)
-                    & (gm == g_b)
-                )
-                if boundary.sum() < 2:
-                    continue
-                for c in find_contours(
-                    boundary.astype(np.float64), level=0.5
-                ):
-                    if c.shape[0] < MIN_TWIN_CONTOUR_POINTS:
-                        continue
-                    y_c, x_c = c[:, 0], c[:, 1]
-                    if len(x_c) > 4:
-                        x_c, y_c = self._smooth_contour(x_c, y_c, sigma)
-                    contours.append(np.column_stack([x_c, y_c]))
-            if contours:
-                result[td["name"]] = {
-                    "contours": contours,
-                    "color": td["color"],
-                }
-        return result
-
-    def _overlay_twin_boundaries(self, ax: Any, m: ebsd.Map) -> None:
-        if not self.chk_show_twins.isChecked():
-            return
-        self.statusBar().showMessage("Detecting twins...")
-        QApplication.processEvents()
-        twin_data = self._detect_twin_boundaries(m)
-        self._twin_boundary_cache = twin_data
-        stats: List[str] = []
-        for name, data in twin_data.items():
-            n = len(data["contours"])
-            stats.append(f"{name}: {n}")
-            ax.add_collection(LineCollection(
-                data["contours"],
-                colors=data["color"],
-                linewidths=self.spin_twin_width.value(),
-                alpha=self.spin_twin_alpha.value(),
-                antialiaseds=True,
-                capstyle="round",
-                joinstyle="round",
-                zorder=12,
-            ))
-        self.lbl_twin_stats.setText(
-            "\n".join(stats) if stats else "No twins detected")
-
     # ================================================================
-    # Scale bar
+    # Async render pipeline
     # ================================================================
 
-    def _add_scalebar(self, ax: Any, step_um: float) -> None:
-        if not self.chk_scalebar.isChecked():
-            return
-        ax.add_artist(ScaleBar(
-            dx=step_um,
-            units="um",
-            dimension="si-length",
-            location=self.combo_scalebar_loc.currentText(),
-            length_fraction=self.spin_scalebar_frac.value(),
-            box_alpha=0.6,
-            frameon=True,
-            color="black",
-        ))
-
-    # ----------------------------------------------------------------
-    # Rendering helpers
-    # ----------------------------------------------------------------
-
-    @staticmethod
-    def _extract_image_array(ax: Any) -> Optional[np.ndarray]:
-        if not ax.images:
-            return None
-        return np.asarray(ax.images[0].get_array()).copy()
-
-    @staticmethod
-    def _is_scalar_map(mt: str) -> bool:
-        return mt in ("KAM", "Misorientation", "Band Contrast")
-
-    @staticmethod
-    def _is_bc_ipf_map(mt: str) -> bool:
-        return mt.startswith("BC+IPF")
-
-    @staticmethod
-    def _bc_ipf_direction(mt: str) -> np.ndarray:
+    def _collect_render_params(self, m: ebsd.Map) -> dict:
+        """Snapshot all UI parameters into a plain dict (main thread only)."""
+        mt = self.combo_map.currentText()
         if "X" in mt:
-            return np.array([1, 0, 0])
-        if "Y" in mt:
-            return np.array([0, 1, 0])
-        return np.array([0, 0, 1])
+            direction = (1, 0, 0)
+        elif "Y" in mt:
+            direction = (0, 1, 0)
+        else:
+            direction = (0, 0, 1)
 
-    def _setup_axes(
-        self,
-        ax: Any,
-        sh: int,
-        sw: int,
-    ) -> None:
-        """Configure axes extents and ticks for a pixel image."""
+        sym = m.crystal_sym
+        active_twin_defs = self._get_active_twin_defs(sym)
+        twin_defs_hash = tuple(
+            (td["name"], td["angle_deg"], td["tolerance_deg"])
+            for td in active_twin_defs
+        )
+
+        return {
+            # Identity
+            "path": str(self.current_path),
+            "step_size": float(m.step_size),
+            "crystal_sym": sym,
+            # Map
+            "map_type": mt,
+            "direction": direction,
+            "gb_angle": self.spin_gb_angle.value(),
+            "min_grain": self.spin_min_grain.value(),
+            "kam_max": self.spin_kam_max.value(),
+            "misori_max": self.spin_misori_max.value(),
+            # Non-indexed / denoise
+            "noindex_method": self.combo_noindex_method.currentText(),
+            "noindex_iter": self.spin_noindex_iter.value(),
+            "denoise_method": self.combo_denoise_method.currentText(),
+            "median_kernel": self.spin_median_kernel.value(),
+            "gauss_sigma": self.spin_gauss_sigma.value(),
+            # BC / IPF
+            "bc_brightness": self.spin_bc_brightness.value(),
+            "bc_contrast": self.spin_bc_contrast.value(),
+            "bc_ipf_alpha": self.spin_bc_ipf_alpha.value(),
+            "bc_ipf_mode": self.combo_bc_ipf_mode.currentText(),
+            # HAGB
+            "show_hagb": self.chk_plot_gbs.isChecked(),
+            "gb_color": self.combo_gb_color.currentText(),
+            "gb_width": self.spin_gb_width.value(),
+            "gb_alpha": self.spin_gb_alpha.value(),
+            "gb_smooth": self.spin_gb_smooth.value(),
+            "hole_fill": self.spin_hole_fill.value(),
+            "frag_merge": self.spin_frag_merge.value(),
+            # LAGB
+            "show_lagb": self.chk_plot_lagb.isChecked(),
+            "lagb_min": self.spin_lagb_min.value(),
+            "lagb_max": self.spin_lagb_max.value(),
+            "lagb_color": self.combo_lagb_color.currentText(),
+            "lagb_width": self.spin_lagb_width.value(),
+            "lagb_alpha": self.spin_lagb_alpha.value(),
+            "lagb_smooth": self.spin_lagb_smooth.value(),
+            "lagb_style": self.combo_lagb_style.currentText(),
+            # Twins
+            "show_twins": self.chk_show_twins.isChecked(),
+            "twin_defs": active_twin_defs,
+            "twin_defs_hash": twin_defs_hash,
+            "twin_tol": self.spin_twin_tol.value(),
+            "twin_width": self.spin_twin_width.value(),
+            "twin_alpha": self.spin_twin_alpha.value(),
+            "strict_axis": self.chk_strict_axis.isChecked(),
+            # Display
+            "scalar_cmap": self.combo_scalar_cmap.currentText(),
+            "show_colorbar": self.chk_show_colorbar.isChecked(),
+            "show_scalebar": self.chk_scalebar.isChecked(),
+            "scalebar_frac": self.spin_scalebar_frac.value(),
+            "scalebar_loc": self.combo_scalebar_loc.currentText(),
+            # Cache snapshots passed to worker
+            "cache_mask": self._cache_mask,
+            "cache_bc": self._cache_bc,
+            "cache_ipf": self._cache_ipf,
+            "cache_clean_gm": self._cache_clean_gm,
+            "cache_neighbor_pairs": self._cache_neighbor_pairs,
+            "cache_twin": self._cache_twin,
+            "cache_lagb_grains": self._cache_lagb_grains,
+            # LAGB independent map (may be None on first use)
+            "cached_lagb_map": self._cached_lagb_map,
+        }
+
+    def _start_render(self, params: dict) -> None:
+        """Dispatch rendering to a background worker thread."""
+        self._render_busy = True
+        worker = _RenderWorker(
+            EbsdMainWindow._compute_render_result, (params, self._cached_raw_map)
+        )
+        thread = QThread(self)
+        self._worker_thread = thread
+        self._current_worker = worker
+        worker.moveToThread(thread)
+        worker.finished.connect(self._on_worker_finished)
+        worker.error.connect(self._on_worker_error)
+        thread.started.connect(worker.run)
+        thread.start()
+
+    def _on_worker_finished(self, result: dict) -> None:
+        """Called in the main thread when the worker completes."""
+        thread = self._worker_thread
+        self._worker_thread = None
+        self._current_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait(2000)
+
+        # Update caches with any newly computed values
+        _cache_map = {
+            "new_cache_mask": "_cache_mask",
+            "new_cache_bc": "_cache_bc",
+            "new_cache_ipf": "_cache_ipf",
+            "new_cache_clean_gm": "_cache_clean_gm",
+            "new_cache_neighbor_pairs": "_cache_neighbor_pairs",
+            "new_cache_twin": "_cache_twin",
+            "new_cache_lagb_grains": "_cache_lagb_grains",
+        }
+        for new_key, attr in _cache_map.items():
+            val = result.get(new_key)
+            if val is not None:
+                setattr(self, attr, val)
+        if result.get("new_cached_lagb_map") is not None:
+            self._cached_lagb_map = result["new_cached_lagb_map"]
+
+        # Draw result in the main thread
+        try:
+            self._draw_render_result(result)
+            self._clear_grain_info()
+        except Exception as exc:
+            logger.error("Draw failed", exc_info=True)
+            self.current_fig_ready = False
+            QMessageBox.critical(self, "Render error", str(exc))
+            self.statusBar().showMessage("Render failed")
+
+        QApplication.restoreOverrideCursor()
+        self._render_busy = False
+
+        # Process any pending render request queued while busy
+        if self._pending_params is not None:
+            p = self._pending_params
+            self._pending_params = None
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            self.statusBar().showMessage("Rendering...")
+            self._start_render(p)
+
+    def _on_worker_error(self, msg: str) -> None:
+        """Called in the main thread when the worker raises an exception."""
+        thread = self._worker_thread
+        self._worker_thread = None
+        self._current_worker = None
+        if thread is not None:
+            thread.quit()
+            thread.wait(2000)
+        self.current_fig_ready = False
+        QApplication.restoreOverrideCursor()
+        self._render_busy = False
+        self.statusBar().showMessage(f"Render failed: {msg}")
+        QMessageBox.critical(self, "Render error", msg)
+
+    @staticmethod
+    def _compute_render_result(params: dict, m: ebsd.Map) -> dict:
+        """Heavy computation executed in the worker thread.
+
+        No Qt widget access is permitted here.
+        """
+        t0 = time.perf_counter()
+
+        mt = params["map_type"]
+        is_bc_ipf = mt.startswith("BC+IPF")
+        path = params["path"]
+
+        # ------ Non-indexed mask ------
+        cache_mask_key, cache_mask_val = params["cache_mask"]
+        if cache_mask_key == path and cache_mask_val is not None:
+            mask = cache_mask_val
+            new_cache_mask = None
+        else:
+            mask = _get_non_indexed_mask_pure(m)
+            new_cache_mask = (path, mask)
+
+        noindex_method = params["noindex_method"]
+        noindex_iter = int(params["noindex_iter"])
+        denoise_method = params["denoise_method"]
+        median_kernel = int(params["median_kernel"])
+        gauss_sigma = float(params["gauss_sigma"])
+
+        image: Optional[np.ndarray] = None
+        is_scalar = False
+        scalar_label: Optional[str] = None
+        vmin = vmax = None
+        new_cache_bc = None
+        new_cache_ipf = None
+
+        # ------ BC + IPF ------
+        if is_bc_ipf:
+            bc_key = (path, params["bc_brightness"], params["bc_contrast"])
+            ck, cv = params["cache_bc"]
+            if ck == bc_key and cv is not None:
+                bc = cv
+            else:
+                bc = _get_bc_array_pure(m, params["bc_brightness"], params["bc_contrast"])
+                new_cache_bc = (bc_key, bc)
+
+            direction = np.array(params["direction"], dtype=float)
+            ipf_key = (path, params["direction"])
+            ik, iv = params["cache_ipf"]
+            if ik == ipf_key and iv is not None:
+                ipf_rgb = iv
+            else:
+                ipf_rgb = _compute_ipf_rgb_pure(m, direction)
+                ipf_rgb = _normalize_rgb_pure(ipf_rgb)
+                new_cache_ipf = (ipf_key, ipf_rgb)
+
+            bc_f = _fill_non_indexed_pure(bc, mask, noindex_method, noindex_iter)
+            bc_f = _denoise_2d_pure(bc_f, denoise_method, median_kernel, gauss_sigma)
+            ipf_f = _fill_non_indexed_pure(ipf_rgb, mask, noindex_method, noindex_iter)
+            ipf_f = _denoise_rgb_pure(ipf_f, denoise_method, median_kernel, gauss_sigma)
+            image = _blend_bc_ipf_pure(
+                bc_f, ipf_f, params["bc_ipf_alpha"], params["bc_ipf_mode"]
+            )
+
+        # ------ Band Contrast ------
+        elif mt == "Band Contrast":
+            bc_key = (path, params["bc_brightness"], params["bc_contrast"])
+            ck, cv = params["cache_bc"]
+            if ck == bc_key and cv is not None:
+                bc = cv
+            else:
+                bc = _get_bc_array_pure(m, params["bc_brightness"], params["bc_contrast"])
+                new_cache_bc = (bc_key, bc)
+            bc_f = _fill_non_indexed_pure(bc, mask, noindex_method, noindex_iter)
+            bc_f = _denoise_2d_pure(bc_f, denoise_method, median_kernel, gauss_sigma)
+            image = bc_f
+            is_scalar = True
+            scalar_label = "Band Contrast"
+            vmin, vmax = 0.0, 1.0
+
+        # ------ Euler ------
+        elif mt == "Euler":
+            fig_tmp = Figure()
+            ax_tmp = fig_tmp.add_subplot(111)
+            try:
+                m.plot_map("euler_angle", "all_euler", fig=fig_tmp, ax=ax_tmp,
+                           plot_scale_bar=False, plot_colour_bar=False)
+                raw = _extract_image_array_static(ax_tmp)
+            except Exception:
+                logger.debug("Euler plot_map failed", exc_info=True)
+                raw = None
+            if raw is not None:
+                a = _normalize_rgb_pure(raw)
+                a = _fill_non_indexed_pure(a, mask, noindex_method, noindex_iter)
+                a = _denoise_rgb_pure(a, denoise_method, median_kernel, gauss_sigma)
+                image = a
+
+        # ------ IPF maps ------
+        elif mt in ("IPF-X", "IPF-Y", "IPF-Z"):
+            ax_key = mt[-1]
+            dir_map: Dict[str, Tuple[int, int, int]] = {
+                "X": (1, 0, 0), "Y": (0, 1, 0), "Z": (0, 0, 1),
+            }
+            direction = np.array(dir_map[ax_key], dtype=float)
+            ipf_key = (path, dir_map[ax_key])
+            ik, iv = params["cache_ipf"]
+            if ik == ipf_key and iv is not None:
+                ipf_rgb = iv
+                new_cache_ipf = None
+            else:
+                ipf_rgb = None
+                try:
+                    fig_tmp = Figure()
+                    ax_tmp = fig_tmp.add_subplot(111)
+                    m.plot_map(
+                        "orientation", f"IPF_{ax_key.lower()}",
+                        fig=fig_tmp, ax=ax_tmp,
+                        plot_scale_bar=False, plot_colour_bar=False,
+                    )
+                    raw = _extract_image_array_static(ax_tmp)
+                    if raw is not None:
+                        ipf_rgb = _normalize_rgb_pure(raw)
+                except Exception:
+                    logger.debug("IPF_%s plot_map failed, using manual", ax_key)
+                if ipf_rgb is None:
+                    ipf_rgb = _compute_ipf_rgb_pure(m, direction)
+                    ipf_rgb = _normalize_rgb_pure(ipf_rgb)
+                new_cache_ipf = (ipf_key, ipf_rgb)
+
+            a = _fill_non_indexed_pure(ipf_rgb, mask, noindex_method, noindex_iter)
+            a = _denoise_rgb_pure(a, denoise_method, median_kernel, gauss_sigma)
+            image = a
+
+        # ------ KAM ------
+        elif mt == "KAM":
+            km = float(params["kam_max"])
+            try:
+                m.calc_kam()
+                a2 = np.asarray(m.data["KAM"]).astype(np.float32)
+            except Exception:
+                logger.debug("KAM extraction fallback", exc_info=True)
+                try:
+                    fig_tmp = Figure()
+                    ax_tmp = fig_tmp.add_subplot(111)
+                    m.calc_kam()
+                    m.plot_map("KAM", vmin=0, vmax=km, fig=fig_tmp, ax=ax_tmp,
+                               plot_scale_bar=False, plot_colour_bar=False)
+                    raw = _extract_image_array_static(ax_tmp)
+                    a2 = (np.mean(raw[..., :3].astype(np.float32), axis=2)
+                          if raw is not None
+                          else np.zeros((1, 1), dtype=np.float32))
+                except Exception:
+                    a2 = np.zeros((1, 1), dtype=np.float32)
+            a2 = _fill_non_indexed_pure(a2, mask, noindex_method, noindex_iter)
+            a2 = _denoise_2d_pure(a2, denoise_method, median_kernel, gauss_sigma)
+            image = a2
+            is_scalar = True
+            scalar_label = "KAM (\u00b0)"
+            vmin, vmax = 0.0, km
+
+        # ------ Boundary ------
+        elif mt == "Boundary":
+            gb = float(params["gb_angle"])
+            m.data.generate("grain_boundaries", misori_tol=gb)
+            fig_tmp = Figure()
+            ax_tmp = fig_tmp.add_subplot(111)
+            try:
+                m.plot_boundary_map(fig=fig_tmp, ax=ax_tmp,
+                                    plot_scale_bar=False, plot_colour_bar=False)
+                raw = _extract_image_array_static(ax_tmp)
+                if raw is not None:
+                    image = _normalize_rgb_pure(raw)
+            except Exception:
+                logger.debug("Boundary plot_map failed", exc_info=True)
+
+        # ------ Grain ------
+        elif mt == "Grain":
+            gb = float(params["gb_angle"])
+            mg_ = int(params["min_grain"])
+            m.data.generate("grain_boundaries", misori_tol=gb)
+            m.data.generate("grains", min_grain_size=mg_)
+            fig_tmp = Figure()
+            ax_tmp = fig_tmp.add_subplot(111)
+            try:
+                m.plot_grain_map(fig=fig_tmp, ax=ax_tmp,
+                                 plot_scale_bar=False, plot_colour_bar=False)
+                raw = _extract_image_array_static(ax_tmp)
+                if raw is not None:
+                    image = _normalize_rgb_pure(raw)
+            except Exception:
+                logger.debug("Grain plot_map failed", exc_info=True)
+
+        # ------ Misorientation ------
+        elif mt == "Misorientation":
+            gb = float(params["gb_angle"])
+            mg_ = int(params["min_grain"])
+            mm = float(params["misori_max"])
+            m.data.generate("grain_boundaries", misori_tol=gb)
+            m.data.generate("grains", min_grain_size=mg_)
+            try:
+                m.calc_grain_mis_ori()
+                a2 = np.asarray(m.data["mis_ori"]).astype(np.float32)
+            except Exception:
+                logger.debug("Misorientation extraction fallback", exc_info=True)
+                try:
+                    fig_tmp = Figure()
+                    ax_tmp = fig_tmp.add_subplot(111)
+                    m.calc_grain_mis_ori()
+                    m.plot_mis_ori_map(
+                        fig=fig_tmp, ax=ax_tmp, vmin=0, vmax=mm,
+                        plot_gbs=False, plot_scale_bar=False,
+                        plot_colour_bar=False,
+                    )
+                    raw = _extract_image_array_static(ax_tmp)
+                    a2 = (np.mean(raw[..., :3].astype(np.float32), axis=2)
+                          if raw is not None
+                          else np.zeros((1, 1), dtype=np.float32))
+                except Exception:
+                    a2 = np.zeros((1, 1), dtype=np.float32)
+            a2 = _fill_non_indexed_pure(a2, mask, noindex_method, noindex_iter)
+            a2 = _denoise_2d_pure(a2, denoise_method, median_kernel, gauss_sigma)
+            image = a2
+            is_scalar = True
+            scalar_label = "Misorientation (\u00b0)"
+            vmin, vmax = 0.0, mm
+
+        if image is None:
+            image = np.zeros((4, 4, 3), dtype=np.float32)
+
+        # ------ Overlays ------
+        hagb_contours: List[np.ndarray] = []
+        lagb_contours: List[np.ndarray] = []
+        twin_data: dict = {}
+        twin_stats: str = ""
+        new_cache_clean_gm = None
+        new_cache_neighbor_pairs = None
+        new_cache_twin = None
+        new_cache_lagb_grains = None
+        new_cached_lagb_map = None
+
+        need_overlays = mt != "Boundary"
+        need_grains = need_overlays and (
+            params["show_hagb"] or params["show_lagb"] or params["show_twins"]
+        )
+
+        clean_gm: Optional[np.ndarray] = None
+        clean_gm_key = (
+            path,
+            params["gb_angle"],
+            params["min_grain"],
+            params["hole_fill"],
+            params["frag_merge"],
+        )
+
+        if need_grains:
+            m.data.generate(
+                "grain_boundaries", misori_tol=params["gb_angle"]
+            )
+            m.data.generate(
+                "grains", min_grain_size=params["min_grain"]
+            )
+            ck, cv = params["cache_clean_gm"]
+            if ck == clean_gm_key and cv is not None:
+                clean_gm = cv
+            else:
+                logger.debug("Rebuilding clean grain map")
+                clean_gm = _build_clean_grain_map_pure(
+                    m,
+                    float(params["gb_angle"]),
+                    int(params["min_grain"]),
+                    int(params["hole_fill"]),
+                    int(params["frag_merge"]),
+                )
+                new_cache_clean_gm = (clean_gm_key, clean_gm)
+
+        if need_overlays and params["show_hagb"] and clean_gm is not None:
+            hagb_contours = _contours_from_grain_map_pure(
+                clean_gm, float(params["gb_smooth"])
+            )
+
+        if need_overlays and params["show_twins"] and clean_gm is not None:
+            np_key = clean_gm_key
+            nk, nv = params["cache_neighbor_pairs"]
+            if nk == np_key and nv is not None:
+                neighbor_pairs = nv
+            else:
+                neighbor_pairs = _find_neighbor_pairs_vectorised(clean_gm)
+                new_cache_neighbor_pairs = (np_key, neighbor_pairs)
+
+            twin_key = clean_gm_key + (
+                params["twin_tol"],
+                params["twin_defs_hash"],
+                params["strict_axis"],
+            )
+            tk, tv = params["cache_twin"]
+            if tk == twin_key and tv is not None:
+                twin_data = tv
+            else:
+                logger.debug("Computing twin boundaries")
+                twin_data = _detect_twin_boundaries_pure(
+                    params, m, clean_gm, neighbor_pairs
+                )
+                new_cache_twin = (twin_key, twin_data)
+
+            parts = [
+                f"{name}: {len(data['contours'])}"
+                for name, data in twin_data.items()
+            ]
+            twin_stats = "\n".join(parts)
+
+        if need_overlays and params["show_lagb"] and clean_gm is not None:
+            lagb_grains_key = (path, params["lagb_min"], params["min_grain"])
+            lk, lv = params["cache_lagb_grains"]
+            if lk == lagb_grains_key and lv is not None:
+                lagb_sub_gm = lv
+            else:
+                logger.debug("Generating LAGB sub-grain map")
+                lagb_map = params.get("cached_lagb_map")
+                if lagb_map is None:
+                    lagb_map = ebsd.Map(path)
+                    new_cached_lagb_map = lagb_map
+                lagb_map.data.generate(
+                    "grain_boundaries",
+                    misori_tol=params["lagb_min"],
+                )
+                lagb_map.data.generate(
+                    "grains",
+                    min_grain_size=max(int(params["min_grain"]) // 2, 2),
+                )
+                lagb_sub_gm = np.asarray(lagb_map.data["grains"]).copy()
+                new_cache_lagb_grains = (lagb_grains_key, lagb_sub_gm)
+                if new_cached_lagb_map is None:
+                    new_cached_lagb_map = lagb_map
+
+            lagb_contours = _extract_lagb_contours_pure(
+                params, m, lagb_sub_gm, clean_gm
+            )
+
+        logger.debug(
+            "_compute_render_result completed in %.3fs",
+            time.perf_counter() - t0,
+        )
+
+        return {
+            "image": image,
+            "is_scalar": is_scalar,
+            "scalar_label": scalar_label,
+            "vmin": vmin,
+            "vmax": vmax,
+            "cmap": params["scalar_cmap"],
+            "hagb_contours": hagb_contours,
+            "hagb_color": params["gb_color"],
+            "hagb_width": params["gb_width"],
+            "hagb_alpha": params["gb_alpha"],
+            "lagb_contours": lagb_contours,
+            "lagb_color": params["lagb_color"],
+            "lagb_width": params["lagb_width"],
+            "lagb_alpha": params["lagb_alpha"],
+            "lagb_style": params["lagb_style"],
+            "twin_data": twin_data,
+            "twin_stats": twin_stats,
+            "twin_width": params["twin_width"],
+            "twin_alpha": params["twin_alpha"],
+            "show_colorbar": params["show_colorbar"],
+            "show_scalebar": params["show_scalebar"],
+            "scalebar_frac": params["scalebar_frac"],
+            "scalebar_loc": params["scalebar_loc"],
+            "step_size": params["step_size"],
+            # Cache updates (None means no change)
+            "new_cache_mask": new_cache_mask,
+            "new_cache_bc": new_cache_bc,
+            "new_cache_ipf": new_cache_ipf,
+            "new_cache_clean_gm": new_cache_clean_gm,
+            "new_cache_neighbor_pairs": new_cache_neighbor_pairs,
+            "new_cache_twin": new_cache_twin,
+            "new_cache_lagb_grains": new_cache_lagb_grains,
+            "new_cached_lagb_map": new_cached_lagb_map,
+        }
+
+    def _draw_render_result(self, result: dict) -> None:
+        """Draw pre-computed result onto the viewer canvas (main thread)."""
+        fig = self.viewer.figure
+        fig.clear()
+        ax = fig.add_subplot(111)
+
+        image = result["image"]
+        sh, sw = image.shape[:2]
+
+        if result["is_scalar"]:
+            im = ax.imshow(
+                image, origin="upper", interpolation="none",
+                extent=[-0.5, sw - 0.5, sh - 0.5, -0.5],
+                aspect="equal",
+                cmap=result["cmap"],
+                vmin=result["vmin"], vmax=result["vmax"],
+            )
+            if result["show_colorbar"] and result["scalar_label"]:
+                fig.colorbar(
+                    im, ax=ax, fraction=0.046, pad=0.04,
+                    label=result["scalar_label"],
+                )
+        else:
+            ax.imshow(
+                image, origin="upper", interpolation="none",
+                extent=[-0.5, sw - 0.5, sh - 0.5, -0.5],
+                aspect="equal",
+            )
+
         ax.set_xlim(-0.5, sw - 0.5)
         ax.set_ylim(sh - 0.5, -0.5)
         ax.set_xticks([])
         ax.set_yticks([])
 
-    # ================================================================
-    # Main render
-    # ================================================================
+        # HAGB overlay
+        if result["hagb_contours"]:
+            ax.add_collection(LineCollection(
+                result["hagb_contours"],
+                colors=result["hagb_color"],
+                linewidths=result["hagb_width"],
+                alpha=result["hagb_alpha"],
+                antialiaseds=True,
+                capstyle="round",
+                joinstyle="round",
+                zorder=10,
+            ))
 
-    def _render_current_map(self, m: ebsd.Map) -> None:
-        fig = self.viewer.figure
-        fig.clear()
-        ax = fig.add_subplot(111)
-        self._ensure_grains(m)
-        mt = self.combo_map.currentText()
-        gb = self.spin_gb_angle.value()
-        mg_ = self.spin_min_grain.value()
-        km = self.spin_kam_max.value()
-        mm = self.spin_misori_max.value()
-        common: dict = dict(
-            fig=fig, ax=ax,
-            plot_scale_bar=False, plot_colour_bar=False,
-        )
-        sl = sv_min = sv_max = None
-        raw = None
-        is_bc_ipf = self._is_bc_ipf_map(mt)
+        # LAGB overlay
+        if result["lagb_contours"]:
+            _stm = {
+                "solid": "solid",
+                "dashed": (0, (5, 3)),
+                "dotted": (0, (1, 2)),
+                "dashdot": "dashdot",
+            }
+            ax.add_collection(LineCollection(
+                result["lagb_contours"],
+                colors=result["lagb_color"],
+                linewidths=result["lagb_width"],
+                alpha=result["lagb_alpha"],
+                linestyles=_stm.get(result["lagb_style"], "dashed"),
+                antialiaseds=True,
+                capstyle="round",
+                joinstyle="round",
+                zorder=11,
+            ))
 
-        noindex_mask = self._get_non_indexed_mask(m)
+        # Twin boundary overlay
+        for name, data in result["twin_data"].items():
+            ax.add_collection(LineCollection(
+                data["contours"],
+                colors=data["color"],
+                linewidths=result["twin_width"],
+                alpha=result["twin_alpha"],
+                antialiaseds=True,
+                capstyle="round",
+                joinstyle="round",
+                zorder=12,
+            ))
 
-        # ---- BC + IPF ----
-        if is_bc_ipf:
-            direction = self._bc_ipf_direction(mt)
-            bc = self._get_bc_array(m)
-            bc = self._fill_non_indexed(bc, noindex_mask)
-            bc = self._denoise_2d(bc)
-            ipf_rgb = self._compute_ipf_rgb(m, direction)
-            ipf_rgb = self._normalize_rgb(ipf_rgb)
-            ipf_rgb = self._fill_non_indexed(ipf_rgb, noindex_mask)
-            ipf_rgb = self._denoise_rgb(ipf_rgb)
-            blended = self._blend_bc_ipf(bc, ipf_rgb)
-            sh, sw = blended.shape[:2]
-            ax.imshow(
-                blended, origin="upper", interpolation="none",
-                extent=[-0.5, sw - 0.5, sh - 0.5, -0.5],
-                aspect="equal",
-            )
-            self._setup_axes(ax, sh, sw)
+        # Update twin stats label
+        ts = result.get("twin_stats", "")
+        self.lbl_twin_stats.setText(ts if ts else "-")
 
-        # ---- Band Contrast ----
-        elif mt == "Band Contrast":
-            bc = self._get_bc_array(m)
-            bc = self._fill_non_indexed(bc, noindex_mask)
-            bc = self._denoise_2d(bc)
-            sh, sw = bc.shape
-            ax.clear()
-            ax.imshow(
-                bc, origin="upper", interpolation="none",
-                extent=[-0.5, sw - 0.5, sh - 0.5, -0.5],
-                aspect="equal", cmap="gray", vmin=0, vmax=1,
-            )
-            self._setup_axes(ax, sh, sw)
-            sl = "Band Contrast"
-            sv_min = 0
-            sv_max = 1
+        # Scale bar
+        if result["show_scalebar"]:
+            ax.add_artist(ScaleBar(
+                dx=result["step_size"],
+                units="um",
+                dimension="si-length",
+                location=result["scalebar_loc"],
+                length_fraction=result["scalebar_frac"],
+                box_alpha=0.6,
+                frameon=True,
+                color="black",
+            ))
 
-        # ---- DefDAP standard maps ----
-        elif mt == "Euler":
-            m.plot_map("euler_angle", "all_euler", **common)
-        elif mt == "IPF-X":
-            try:
-                m.plot_map("orientation", "IPF_x", **common)
-            except Exception:
-                logger.debug("IPF_x fallback to manual computation")
-                raw = self._compute_ipf_rgb(m, np.array([1, 0, 0]))
-        elif mt == "IPF-Y":
-            try:
-                m.plot_map("orientation", "IPF_y", **common)
-            except Exception:
-                logger.debug("IPF_y fallback to manual computation")
-                raw = self._compute_ipf_rgb(m, np.array([0, 1, 0]))
-        elif mt == "IPF-Z":
-            try:
-                m.plot_map("orientation", "IPF_z", **common)
-            except Exception:
-                logger.debug("IPF_z fallback to manual computation")
-                raw = self._compute_ipf_rgb(m, np.array([0, 0, 1]))
-        elif mt == "KAM":
-            m.calc_kam()
-            m.plot_map("KAM", vmin=0, vmax=km, **common)
-            sl = "KAM (°)"
-            sv_min = 0
-            sv_max = km
-        elif mt == "Boundary":
-            m.data.generate("grain_boundaries", misori_tol=gb)
-            m.plot_boundary_map(
-                fig=fig, ax=ax,
-                plot_scale_bar=False, plot_colour_bar=False,
-            )
-        elif mt == "Grain":
-            m.data.generate("grain_boundaries", misori_tol=gb)
-            m.data.generate("grains", min_grain_size=mg_)
-            m.plot_grain_map(
-                fig=fig, ax=ax,
-                plot_scale_bar=False, plot_colour_bar=False,
-            )
-        elif mt == "Misorientation":
-            m.data.generate("grain_boundaries", misori_tol=gb)
-            m.data.generate("grains", min_grain_size=mg_)
-            m.calc_grain_mis_ori()
-            m.plot_mis_ori_map(
-                fig=fig, ax=ax, vmin=0, vmax=mm,
-                plot_gbs=False, plot_scale_bar=False,
-                plot_colour_bar=False,
-            )
-            sl = "Misorientation (°)"
-            sv_min = 0
-            sv_max = mm
-
-        # ---- Post-processing for non BC+IPF / non BC maps ----
-        if not is_bc_ipf and mt != "Band Contrast":
-            if raw is None:
-                raw = self._extract_image_array(ax)
-            if raw is None:
-                self._add_scalebar(ax, m.step_size)
-                fig.tight_layout()
-                self.viewer.canvas.draw_idle()
-                self.current_fig_ready = True
-                return
-
-            if self._is_scalar_map(mt):
-                a2 = raw
-                if a2.ndim == 3:
-                    if mt == "KAM":
-                        try:
-                            a2 = np.asarray(
-                                m.data["KAM"]).astype(np.float32)
-                        except Exception:
-                            a2 = np.mean(
-                                raw[..., :3].astype(np.float32), axis=2)
-                    elif mt == "Misorientation":
-                        try:
-                            a2 = np.asarray(
-                                m.data["mis_ori"]).astype(np.float32)
-                        except Exception:
-                            a2 = np.mean(
-                                raw[..., :3].astype(np.float32), axis=2)
-                if a2.ndim != 2:
-                    a2 = np.mean(a2.astype(np.float32), axis=2)
-                a2 = self._fill_non_indexed(a2, noindex_mask)
-                a2 = self._denoise_2d(a2)
-                sh, sw = a2.shape
-                ax.clear()
-                im = ax.imshow(
-                    a2, origin="upper", interpolation="none",
-                    extent=[-0.5, sw - 0.5, sh - 0.5, -0.5],
-                    aspect="equal",
-                    cmap=self.combo_scalar_cmap.currentText(),
-                    vmin=sv_min, vmax=sv_max,
-                )
-                self._setup_axes(ax, sh, sw)
-                if self.chk_show_colorbar.isChecked() and sl:
-                    fig.colorbar(
-                        im, ax=ax, fraction=0.046,
-                        pad=0.04, label=sl,
-                    )
-            else:
-                a = self._normalize_rgb(raw)
-                a = self._fill_non_indexed(a, noindex_mask)
-                a = self._denoise_rgb(a)
-                sh, sw = a.shape[:2]
-                ax.clear()
-                ax.imshow(
-                    a, origin="upper", interpolation="none",
-                    extent=[-0.5, sw - 0.5, sh - 0.5, -0.5],
-                    aspect="equal",
-                )
-                self._setup_axes(ax, sh, sw)
-
-        # Band Contrast colorbar
-        if (
-            mt == "Band Contrast"
-            and self.chk_show_colorbar.isChecked()
-            and ax.images
-        ):
-            fig.colorbar(
-                ax.images[0], ax=ax, fraction=0.046,
-                pad=0.04, label="Band Contrast",
-            )
-
-        # Boundary overlays
-        if mt != "Boundary":
-            self._overlay_hagb(ax, m)
-            self._overlay_lagb(ax, m)
-            self._overlay_twin_boundaries(ax, m)
-
-        self._add_scalebar(ax, m.step_size)
         fig.tight_layout()
         self.viewer.canvas.draw_idle()
         self.current_fig_ready = True
+        self.statusBar().showMessage("Ready")
 
     # ================================================================
     # Pole figure / IPF windows
@@ -1977,6 +2592,9 @@ class EbsdMainWindow(QMainWindow):
     # ================================================================
 
     def on_canvas_click(self, event: Any) -> None:
+        if self._render_busy:
+            self.statusBar().showMessage("Rendering in progress, click later...")
+            return
         if self.current_map is None or event.inaxes is None:
             return
         if event.xdata is None or event.ydata is None:
@@ -2066,7 +2684,7 @@ class EbsdMainWindow(QMainWindow):
                 f"No CRC found:\n{p.with_suffix('.crc')}")
             return
         self.current_path = p
-        self._cached_raw_map = None  # invalidate cache for new file
+        self._invalidate_all_caches()
         self.statusBar().showMessage(f"Loaded: {p}")
         self._update_control_states(True)
         self.refresh_plot()
@@ -2075,21 +2693,20 @@ class EbsdMainWindow(QMainWindow):
         if self.current_path is None:
             return
         try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            self.statusBar().showMessage("Rendering...")
             m = self._load_map()
             self.current_map = m
             self._update_info(m)
-            self._render_current_map(m)
-            self._clear_grain_info()
-            self.statusBar().showMessage("Ready")
         except Exception as exc:
-            self.current_fig_ready = False
-            logger.error("Render failed", exc_info=True)
-            QMessageBox.critical(self, "Render error", f"{exc}")
-            self.statusBar().showMessage("Render failed")
-        finally:
-            QApplication.restoreOverrideCursor()
+            logger.error("Map load failed", exc_info=True)
+            QMessageBox.critical(self, "Load error", str(exc))
+            return
+        params = self._collect_render_params(m)
+        if self._render_busy:
+            self._pending_params = params
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        self.statusBar().showMessage("Rendering...")
+        self._start_render(params)
 
     def save_image(self) -> None:
         if not self.current_fig_ready:
