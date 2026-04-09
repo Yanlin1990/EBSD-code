@@ -376,7 +376,7 @@ def _vectorised_median_fill_rgb(
         return img
     for ch in range(img.shape[2]):
         filtered = median_filter(img[:, :, ch], size=3)
-        img[:, :, ch][mask] = filtered[mask]
+        img[mask, ch] = filtered[mask]
     return img
 
 
@@ -740,9 +740,7 @@ def _detect_twin_boundaries_pure(
         ys, xs = np.where(clean_gm == gid)
         n_px = len(ys)
         if n_px > MAX_GRAIN_SAMPLE:
-            idx = np.round(
-                np.linspace(0, n_px - 1, MAX_GRAIN_SAMPLE)
-            ).astype(int)
+            idx = np.linspace(0, n_px - 1, MAX_GRAIN_SAMPLE).astype(int)
             ys_s, xs_s = ys[idx], xs[idx]
         else:
             ys_s, xs_s = ys, xs
