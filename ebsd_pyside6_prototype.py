@@ -493,7 +493,7 @@ def _normalize_rgb_pure(a: np.ndarray) -> np.ndarray:
     elif a.dtype != np.float32:
         a = a.astype(np.float32)
     mx = float(a.max())
-    if mx > 1.001 and mx > 0:
+    if mx > 1.001:
         a = a / mx
     if a.ndim == 3 and a.shape[2] == 4:
         a = a[:, :, :3]
@@ -502,8 +502,12 @@ def _normalize_rgb_pure(a: np.ndarray) -> np.ndarray:
 
 def _compute_ipf_rgb_pure(m: Any, direction: np.ndarray) -> np.ndarray:
     """Compute IPF colour map for given reference direction."""
-    ea = np.asarray(m.data.euler_angle)  # (3, H, W)
-    H, W = ea.shape[1], ea.shape[2]
+    ea = np.asarray(m.data.euler_angle)  # expected shape (3, H, W)
+    if ea.ndim == 3:
+        H, W = ea.shape[1], ea.shape[2]
+    else:
+        bc = np.asarray(m.data.band_contrast)
+        H, W = bc.shape[0], bc.shape[1]
     q = np.array(m.data["orientation"])
     fq = q.ravel()
     rgb = Quat.calc_ipf_colours(fq, direction, m.crystal_sym)
