@@ -493,7 +493,7 @@ def _normalize_rgb_pure(a: np.ndarray) -> np.ndarray:
     elif a.dtype != np.float32:
         a = a.astype(np.float32)
     mx = float(a.max())
-    if mx > 1.5 and mx > 0:
+    if mx > 1.001:
         a = a / mx
     if a.ndim == 3 and a.shape[2] == 4:
         a = a[:, :, :3]
@@ -502,10 +502,16 @@ def _normalize_rgb_pure(a: np.ndarray) -> np.ndarray:
 
 def _compute_ipf_rgb_pure(m: Any, direction: np.ndarray) -> np.ndarray:
     """Compute IPF colour map for given reference direction."""
+    ea = np.asarray(m.data.euler_angle)  # expected shape (3, H, W)
+    if ea.ndim == 3:
+        H, W = ea.shape[1], ea.shape[2]
+    else:
+        bc = np.asarray(m.data.band_contrast)
+        H, W = bc.shape[0], bc.shape[1]
     q = np.array(m.data["orientation"])
     fq = q.ravel()
     rgb = Quat.calc_ipf_colours(fq, direction, m.crystal_sym)
-    return rgb.T.reshape(q.shape + (3,)).astype(np.float32)
+    return rgb.T.reshape((H, W, 3)).astype(np.float32)
 
 
 def _fill_non_indexed_pure(
@@ -616,8 +622,6 @@ def _blend_bc_ipf_pure(
 
 def _build_clean_grain_map_pure(
     m: Any,
-    gb_angle: float,
-    min_grain: int,
     hole_fill: int,
     frag_merge: int,
 ) -> np.ndarray:
@@ -1095,9 +1099,9 @@ class EbsdMainWindow(QMainWindow):
         self.combo_denoise_method = self._register(QComboBox())
         self.combo_denoise_method.addItems(["None", "Median", "Gaussian"])
         form.addRow("Denoise", self.combo_denoise_method)
-        self.spin_median_kernel = self._ispin(1, 21, 1, 2)
+        self.spin_median_kernel = self._ispin(1, 21, 3, 2)
         form.addRow("Median kernel", self.spin_median_kernel)
-        self.spin_gauss_sigma = self._dspin(0.0, 10.0, 0.0, 0.1, 1)
+        self.spin_gauss_sigma = self._dspin(0.0, 10.0, 1.0, 0.1, 1)
         form.addRow("Gauss sigma", self.spin_gauss_sigma)
 
         # HAGB
@@ -1797,9 +1801,9 @@ class EbsdMainWindow(QMainWindow):
     def _collect_render_params(self, m: ebsd.Map) -> dict:
         """Snapshot all UI parameters into a plain dict (main thread only)."""
         mt = self.combo_map.currentText()
-        if "X" in mt:
+        if mt.endswith("-X"):
             direction = (1, 0, 0)
-        elif "Y" in mt:
+        elif mt.endswith("-Y"):
             direction = (0, 1, 0)
         else:
             direction = (0, 0, 1)
@@ -2219,8 +2223,6 @@ class EbsdMainWindow(QMainWindow):
                 logger.debug("Rebuilding clean grain map")
                 clean_gm = _build_clean_grain_map_pure(
                     m,
-                    float(params["gb_angle"]),
-                    int(params["min_grain"]),
                     int(params["hole_fill"]),
                     int(params["frag_merge"]),
                 )
