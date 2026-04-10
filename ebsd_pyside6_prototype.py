@@ -1564,14 +1564,23 @@ class EbsdMainWindow(QMainWindow):
 
         self.combo_denoise_method = self._register(QComboBox())
         self.combo_denoise_method.addItems(["None", "Median", "Gaussian"])
-        self.combo_denoise_method.setCurrentText("None")
+        self.combo_denoise_method.setCurrentText("None")  # off by default; user opts in
+        self.combo_denoise_method.setToolTip(
+            "None: no smoothing\n"
+            "Median: rank filter (kernel size below must be >= 3)\n"
+            "Gaussian: convolution with Gaussian (sigma below must be > 0)\n"
+            "Kernel/sigma defaults are pre-set to sensible values so "
+            "denoising takes effect immediately when enabled."
+        )
         form.addRow("Denoise", self.combo_denoise_method)
 
-        # Default kernel=3 (not 1, which would skip denoising entirely)
+        # Default kernel=3 (not 1): kernel=1 maps to a no-op 1x1 window,
+        # and the k < 2 guard in denoise_2d/denoise_rgb would skip filtering.
         self.spin_median_kernel = self._ispin(1, 21, 3, 2)
         form.addRow("Median kernel", self.spin_median_kernel)
 
-        # Default sigma=1.0 (not 0.0, which would skip denoising entirely)
+        # Default sigma=1.0 (not 0.0): sigma=0 triggers the sigma < 0.01
+        # guard in denoise_2d/denoise_rgb, resulting in a no-op.
         self.spin_gauss_sigma = self._dspin(0.0, 10.0, 1.0, 0.1, 1)
         form.addRow("Gauss sigma", self.spin_gauss_sigma)
 
